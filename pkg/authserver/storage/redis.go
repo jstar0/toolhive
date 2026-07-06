@@ -1044,6 +1044,48 @@ func (s *RedisStorage) DeleteUpstreamTokens(ctx context.Context, sessionID strin
 	return nil
 }
 
+// DeleteUpstreamTokensForProvider removes tokens for a single (sessionID, providerName),
+// leaving sibling providers' rows intact. Absent row returns nil.
+func (s *RedisStorage) DeleteUpstreamTokensForProvider(ctx context.Context, sessionID, providerName string) error {
+	if sessionID == "" {
+		return fosite.ErrInvalidRequest.WithHint("session ID cannot be empty")
+	}
+	if providerName == "" {
+		return fosite.ErrInvalidRequest.WithHint("provider name cannot be empty")
+	}
+
+	key := redisUpstreamKey(s.keyPrefix, sessionID, providerName)
+	idxKey := redisSetKey(s.keyPrefix, KeyTypeUpstreamIdx, sessionID)
+
+	// Best-effort: read UserID for reverse-index cleanup before deleting.
+	var userID string
+	data, err := s.client.Get(ctx, key).Bytes()
+	if err == nil && string(data) != nullMarker {
+		var stored storedUpstreamTokens
+		if unmarshalErr := json.Unmarshal(data, &stored); unmarshalErr == nil {
+			userID = stored.UserID
+		}
+	}
+	// redis.Nil (key absent) or any error on GET: skip user-index cleanup gracefully.
+
+	// Del returns count 0 on absent key — treat as nil (not ErrNotFound).
+	if delErr := s.client.Del(ctx, key).Err(); delErr != nil {
+		return fmt.Errorf("failed to delete upstream tokens for provider: %w", delErr)
+	}
+
+	// Best-effort secondary index cleanup — leave sibling members in idxKey intact.
+	// If this was the last provider for the session, the set becomes empty and
+	// expires by its own TTL; we do not delete the set key itself (intentional,
+	// matching the best-effort cleanup posture of DeleteUpstreamTokens).
+	warnOnCleanupErr(s.client.SRem(ctx, idxKey, key).Err(), "SRem", idxKey)
+	if userID != "" {
+		userUpstreamSetKey := redisSetKey(s.keyPrefix, KeyTypeUserUpstream, userID)
+		warnOnCleanupErr(s.client.SRem(ctx, userUpstreamSetKey, key).Err(), "SRem", userUpstreamSetKey)
+	}
+
+	return nil
+}
+
 // GetLatestUpstreamTokensForUser returns the upstream token row for (userID, providerID)
 // with the highest ExpiresAt across all sessions.
 //
@@ -1378,6 +1420,7 @@ type storedPendingAuthorization struct {
 	ResolvedUserName     string   `json:"resolved_user_name,omitempty"`
 	ResolvedUserEmail    string   `json:"resolved_user_email,omitempty"`
 	SingleLeg            bool     `json:"single_leg,omitempty"`
+	ChainUpstreams       []string `json:"chain_upstreams,omitempty"`
 	CreatedAt            int64    `json:"created_at"`
 }
 
@@ -1408,6 +1451,7 @@ func (s *RedisStorage) StorePendingAuthorization(ctx context.Context, state stri
 		ResolvedUserName:     pending.ResolvedUserName,
 		ResolvedUserEmail:    pending.ResolvedUserEmail,
 		SingleLeg:            pending.SingleLeg,
+		ChainUpstreams:       slices.Clone(pending.ChainUpstreams),
 		CreatedAt:            pending.CreatedAt.Unix(),
 	}
 
@@ -1459,6 +1503,7 @@ func (s *RedisStorage) LoadPendingAuthorization(ctx context.Context, state strin
 		ResolvedUserName:     stored.ResolvedUserName,
 		ResolvedUserEmail:    stored.ResolvedUserEmail,
 		SingleLeg:            stored.SingleLeg,
+		ChainUpstreams:       slices.Clone(stored.ChainUpstreams),
 		CreatedAt:            createdAt,
 	}, nil
 }
